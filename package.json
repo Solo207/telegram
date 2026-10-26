@@ -1,0 +1,16 @@
+{
+  "name": "tg-gateway",
+  "version": "1.0.0",
+  "description": "Telegram MTProto gateway (GramJS) for n8n: message webhooks + media download + send",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "session": "node generate-session.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "big-integer": "^1.6.52",
+    "express": "^4.21.2",
+    "telegram": "^2.26.22"
+  }
+}
