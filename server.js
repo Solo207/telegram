@@ -26,8 +26,16 @@ for (const [k, v] of Object.entries({ TG_API_ID, TG_API_HASH, TG_SESSION, API_KE
   }
 }
 
+let stringSession;
+try {
+  stringSession = new StringSession(TG_SESSION.trim());
+} catch (_) {
+  console.error('TG_SESSION is not a valid session string. Re-run generate-session.js and paste the WHOLE string on one line, no quotes or spaces.');
+  process.exit(1);
+}
+
 const client = new TelegramClient(
-  new StringSession(TG_SESSION),
+  stringSession,
   Number(TG_API_ID),
   TG_API_HASH,
   { connectionRetries: 10, autoReconnect: true },
@@ -157,8 +165,10 @@ async function onNewMessage(event) {
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
+// Always 200 once the process is up, so Docker/EasyPanel health checks don't kill the
+// container while Telegram is still connecting. `telegram` shows the real link status.
 app.get('/health', (_req, res) => {
-  res.status(client.connected ? 200 : 503).json({ ok: !!client.connected });
+  res.json({ ok: true, telegram: !!client.connected });
 });
 
 app.use((req, res, next) => {
@@ -239,6 +249,16 @@ app.get('/messages', async (req, res) => {
 /* ---------------------------------- boot ---------------------------------- */
 
 (async () => {
+  console.log('Starting tg-gateway...');
+  const server = app.listen(Number(PORT), '0.0.0.0', () =>
+    console.log(`HTTP API listening on :${PORT}`),
+  );
+  server.on('error', (e) => {
+    console.error('HTTP server error:', e.message);
+    process.exit(1);
+  });
+
+  console.log('Connecting to Telegram...');
   await client.connect();
   if (!(await client.checkAuthorization())) {
     console.error('Session is not authorized. Re-run generate-session.js and update TG_SESSION.');
@@ -249,8 +269,7 @@ app.get('/messages', async (req, res) => {
 
   await warmEntityCache();
   client.addEventHandler(onNewMessage, new NewMessage({}));
-
-  const server = app.listen(Number(PORT), () => console.log(`HTTP API listening on :${PORT}`));
+  console.log('Listening for new messages.');
 
   const shutdown = async () => {
     server.close();
