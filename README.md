@@ -15,6 +15,22 @@ All endpoints (except `/health`) need header `x-api-key: <API_KEY>`.
 | `POST /send` `{chatId, text, replyTo?}` | Send a message (`chatId` may be `me` or `@username`) |
 | `GET /messages?chatId=..&limit=20` | Recent messages |
 
+## Webhook payload (what n8n receives in `body`)
+
+    direction        "incoming" | "outgoing"   (out: true/false)
+    chat.type        "user" | "bot" | "group" | "channel"   (chat.isSupergroup for big groups)
+    sender.type      "user" | "bot" | "group" | "channel"   (+ sender.name / username / id)
+    text             message text; for photos/files this is the caption
+    caption          same as text, but only when the message has media
+    hasMedia, mediaType (photo|video|voice|audio|sticker|gif|document), fileName, mimeType, fileSize
+    downloadUrl      GET it with the x-api-key header to fetch the file
+    base64           the file itself (only when EMBED_MEDIA=true)
+    isReply, replyToMessageId
+    replyTo          the full message being replied to (same shape, without its own replyTo)
+    mentioned        true if you were @-tagged
+    groupedId        same value on every photo of one album
+    forwardedFrom    original channel/user + post id, if forwarded
+
 ## 1. Get a session string (once)
 
 Get `API_ID` / `API_HASH` from https://my.telegram.org/apps, then:
