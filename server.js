@@ -3,9 +3,9 @@
 const crypto = require('crypto');
 const express = require('express');
 const bigInt = require('big-integer');
-const { TelegramClient, utils } = require('telegram');
+const { TelegramClient, Api, utils } = require('telegram');
 const { StringSession } = require('telegram/sessions');
-const { NewMessage, EditedMessage, DeletedMessage } = require('telegram/events');
+const { NewMessage, Raw } = require('telegram/events');
 
 const {
   TG_API_ID,
@@ -441,16 +441,25 @@ async function onNewMessage(event) {
 }
 
 // Edited message -> { type: "edited", before, after }
-// Only reported for tracked chats. before is null if the original was never cached.
-async function onEditedMessage(event) {
+// The raw edit update holds the new message, so we fetch the wrapped version by ID
+// to get the same fields as everywhere else.
+async function onRawEdit(update) {
   try {
-    const m = event.message;
-    const chatId = String(m.chatId);
-    if (!isTracked(chatId)) return;
+    const raw = update.message;
+    if (!raw || !raw.peerId) return;
 
-    const before = messageCache.get(cacheKey(chatId, m.id)) || null;
-    const title = await chatTitleOf(m);
-    const after = summarize(m, title);
+    const peerId = peerIdOf(raw.peerId);
+    if (!peerId || !isTracked(peerId)) return;
+
+    const [fresh] = await withPeer(peerId, (peer) =>
+      client.getMessages(peer, { ids: [raw.id] }),
+    );
+    if (!fresh) return;
+
+    const chatId = String(fresh.chatId);
+    const before = messageCache.get(cacheKey(chatId, fresh.id)) || null;
+    const title = await chatTitleOf(fresh);
+    const after = summarize(fresh, title);
     remember(after);
 
     const snapshot = (s) => ({
@@ -467,77 +476,84 @@ async function onEditedMessage(event) {
       chatId,
       chatTitle: title,
       detectedAt: nowWAT(),
-      editedAt: toWATIso(m.editDate),
+      editedAt: toWATIso(fresh.editDate),
       sameMessageId: before ? String(before.messageId) === String(after.messageId) : null,
       before: before ? snapshot(before) : null,
       after: snapshot(after),
     });
   } catch (e) {
-    console.error('onEditedMessage error:', e);
+    console.error('onRawEdit error:', e);
   }
 }
 
-// Deleted message -> { type: "deleted", messageId, chatId, content, ... }
-// Telegram sends only IDs. Content comes from the cache when the message was seen.
-async function onDeletedMessage(event) {
+// Deleted messages -> { type: "deleted", ... }
+// Telegram sends only IDs. Channel and supergroup deletions include the channel ID;
+// other deletions don't, so the chat is matched from the cache by message ID.
+async function onRawDelete(update) {
   try {
-    const peerId = peerIdOf(event.peer);
-
-    // Known chat that is not tracked: ignore.
-    if (peerId && !isTracked(peerId)) return;
-
-    const detectedAt = nowWAT();
-
-    for (const rawId of event.deletedIds || []) {
-      const messageId = Number(rawId);
-      const found = findCached(peerId, messageId);
-
-      let original = null;
-      let candidates;
-      if (Array.isArray(found)) {
-        if (found.length === 1) original = found[0];
-        else if (found.length > 1) {
-          // Chat unknown and several cached messages share this ID: report each candidate.
-          candidates = found.map((s) => ({
-            chatId: s.chatId,
-            chatTitle: s.chatTitle,
-            senderId: s.senderId,
-            sentAt: s.sentAt,
-            text: s.text,
-          }));
-        }
-      } else {
-        original = found;
-      }
-
-      // Chat unknown and nothing cached: with tracking on we can't tell if the
-      // message was in a tracked chat, so skip it.
-      if (!peerId && TRACKING_ON && !original && !candidates) continue;
-
-      if (original) messageCache.delete(cacheKey(original.chatId, original.messageId));
-
-      await postToN8n({
-        type: 'deleted',
-        messageId,
-        chatId: peerId || original?.chatId || null,
-        chatTitle: original?.chatTitle ?? null,
-        chatInferred: !peerId && !!original, // true when the chat was matched by message ID only
-        detectedAt,
-        cached: !!original,
-        content: original
-          ? {
-              text: original.text,
-              senderId: original.senderId,
-              sentAt: original.sentAt,
-              hasMedia: original.hasMedia,
-              mediaType: original.mediaType,
-            }
-          : null,
-        candidates,
-      });
-    }
+    const peerId =
+      update.className === 'UpdateDeleteChannelMessages'
+        ? String(utils.getPeerId(new Api.PeerChannel({ channelId: update.channelId })))
+        : null;
+    await reportDeleted(peerId, update.messages || []);
   } catch (e) {
-    console.error('onDeletedMessage error:', e);
+    console.error('onRawDelete error:', e);
+  }
+}
+
+async function reportDeleted(peerId, rawIds) {
+  // Known chat that is not tracked: ignore.
+  if (peerId && !isTracked(peerId)) return;
+
+  const detectedAt = nowWAT();
+
+  for (const rawId of rawIds) {
+    const messageId = Number(rawId);
+    const found = findCached(peerId, messageId);
+
+    let original = null;
+    let candidates;
+    if (Array.isArray(found)) {
+      if (found.length === 1) original = found[0];
+      else if (found.length > 1) {
+        // Chat unknown and several cached messages share this ID: report each candidate.
+        candidates = found.map((s) => ({
+          chatId: s.chatId,
+          chatTitle: s.chatTitle,
+          senderId: s.senderId,
+          sentAt: s.sentAt,
+          text: s.text,
+        }));
+      }
+    } else {
+      original = found;
+    }
+
+    // Chat unknown and nothing cached: with tracking on we can't confirm the chat
+    // is tracked, so skip it.
+    if (!peerId && TRACKING_ON && !original && !candidates) continue;
+
+    if (original) messageCache.delete(cacheKey(original.chatId, original.messageId));
+
+    await postToN8n({
+      type: 'deleted',
+      messageId,
+      chatId: peerId || original?.chatId || null,
+      chatTitle: original?.chatTitle ?? null,
+      chatInferred: !peerId && !!original, // true when the chat was matched by message ID only
+      detectedAt,
+      cached: !!original,
+      content: original
+        ? {
+            text: original.text,
+            senderId: original.senderId,
+            sentAt: original.sentAt,
+            hasMedia: original.hasMedia,
+            mediaType: original.mediaType,
+          }
+        : null,
+      candidates,
+    });
   }
 }
 
@@ -695,8 +711,14 @@ app.post('/history', async (req, res) => {
   await warmEntityCache();
 
   client.addEventHandler(onNewMessage, new NewMessage({}));
-  client.addEventHandler(onEditedMessage, new EditedMessage({}));
-  client.addEventHandler(onDeletedMessage, new DeletedMessage({}));
+  client.addEventHandler(
+    onRawEdit,
+    new Raw({ types: [Api.UpdateEditMessage, Api.UpdateEditChannelMessage] }),
+  );
+  client.addEventHandler(
+    onRawDelete,
+    new Raw({ types: [Api.UpdateDeleteMessages, Api.UpdateDeleteChannelMessages] }),
+  );
 
   // Fill the cache in the background so the server starts answering right away.
   prefillCache();
