@@ -117,8 +117,10 @@ function summarize(m, chatTitle) {
 
 /* ------------------------------ history helpers ------------------------------ */
 
-const MAX_HISTORY_LIMIT = 500; // max messages returned per request
-const MAX_HISTORY_SCAN = 5000; // max messages examined per request (caps Telegram API calls)
+const MAX_HISTORY_LIMIT = 500;   // max messages returned per request
+const MAX_HISTORY_SCAN = 5000;   // max messages examined when a single chat is requested
+const MAX_DIALOGS = 50;          // chats examined when no chatId is given
+const MAX_SCAN_PER_CHAT = 500;   // messages examined per chat in all-chats mode, when filtering by sender
 
 // [123, "456"] -> Set("123", "456"). Missing, null or empty -> null (no sender filter).
 // Throws on anything that is not an array of numeric IDs.
@@ -129,6 +131,75 @@ function parseSenderIds(input) {
   const bad = ids.find((id) => !/^\d+$/.test(id));
   if (bad) throw new Error(`invalid Telegram ID in senderIds: ${bad}`);
   return ids.length ? new Set(ids) : null;
+}
+
+function clampLimit(raw) {
+  return Math.min(Math.max(parseInt(raw, 10) || 20, 1), MAX_HISTORY_LIMIT);
+}
+
+// Last `limit` messages in one chat, newest first.
+async function historyForChat(chatId, limit, senders) {
+  const { found, scanned } = await withPeer(chatId, async (peer) => {
+    const matched = [];
+    let examined = 0;
+    for await (const m of client.iterMessages(peer, { limit: MAX_HISTORY_SCAN })) {
+      examined++;
+      if (!m || !m.id) continue;
+      if (senders && !senders.has(String(m.senderId))) continue;
+      matched.push(m);
+      if (matched.length >= limit) break;
+    }
+    return { found: matched, scanned: examined };
+  });
+
+  let chatTitle = null;
+  if (found.length) {
+    try {
+      const chat = await found[0].getChat();
+      chatTitle = chat?.title || chat?.username || chat?.firstName || null;
+    } catch (_) {}
+  }
+
+  return {
+    count: found.length,
+    scanned,
+    messages: found.map((m) => summarize(m, chatTitle)),
+  };
+}
+
+// Last `limit` messages across the most recent chats, newest first.
+async function historyAcrossChats(limit, senders) {
+  const dialogs = await client.getDialogs({ limit: MAX_DIALOGS });
+  const collected = [];
+  let scanned = 0;
+
+  for (const d of dialogs) {
+    if (!d.inputEntity) continue;
+    const title = d.title || d.name || null;
+    const perChat = [];
+    let examined = 0;
+
+    try {
+      const scanLimit = senders ? MAX_SCAN_PER_CHAT : limit;
+      for await (const m of client.iterMessages(d.inputEntity, { limit: scanLimit })) {
+        examined++;
+        if (!m || !m.id) continue;
+        if (senders && !senders.has(String(m.senderId))) continue;
+        perChat.push(summarize(m, title));
+        if (perChat.length >= limit) break;
+      }
+    } catch (e) {
+      console.error(`history scan failed for "${title}":`, e.message);
+      continue;
+    }
+
+    scanned += examined;
+    collected.push(...perChat);
+  }
+
+  collected.sort((a, b) => b.date - a.date);
+  const messages = collected.slice(0, limit);
+  return { count: messages.length, scanned, messages };
 }
 
 const NUMERIC_ID_RE = /^-?\d+$/;
@@ -254,14 +325,17 @@ app.get('/messages', async (req, res) => {
   }
 });
 
-// POST /history  { chatId, limit?, senderIds? }
-// Returns the most recent `limit` messages in the chat (newest first).
+// POST /history  { chatId?, limit?, senderIds? }
+// With chatId: the most recent `limit` messages in that chat, newest first.
+// Without chatId: the most recent `limit` messages across your recent chats, newest first.
 // If senderIds is a non-empty array, only messages from those Telegram user IDs are returned.
 app.post('/history', async (req, res) => {
-  const { chatId, limit: rawLimit, senderIds: rawSenderIds } = req.body || {};
+  const { chatId: rawChatId, limit: rawLimit, senderIds: rawSenderIds } = req.body || {};
 
-  if (!chatId) return res.status(400).json({ error: 'chatId is required' });
-  if (!NUMERIC_ID_RE.test(String(chatId))) {
+  const chatId =
+    rawChatId === undefined || rawChatId === null ? '' : String(rawChatId).trim();
+
+  if (chatId && !NUMERIC_ID_RE.test(chatId)) {
     return res.status(400).json({ error: 'chatId must be a numeric Telegram ID' });
   }
 
@@ -272,36 +346,15 @@ app.post('/history', async (req, res) => {
     return res.status(400).json({ error: e.message });
   }
 
-  const limit = Math.min(Math.max(parseInt(rawLimit, 10) || 20, 1), MAX_HISTORY_LIMIT);
+  const limit = clampLimit(rawLimit);
 
   try {
-    const { found, scanned } = await withPeer(chatId, async (peer) => {
-      const matched = [];
-      let examined = 0;
-      for await (const m of client.iterMessages(peer, { limit: MAX_HISTORY_SCAN })) {
-        examined++;
-        if (!m || !m.id) continue;
-        if (senders && !senders.has(String(m.senderId))) continue;
-        matched.push(m);
-        if (matched.length >= limit) break;
-      }
-      return { found: matched, scanned: examined };
-    });
-
-    let chatTitle = null;
-    if (found.length) {
-      try {
-        const chat = await found[0].getChat();
-        chatTitle = chat?.title || chat?.username || chat?.firstName || null;
-      } catch (_) {}
+    if (chatId) {
+      const result = await historyForChat(chatId, limit, senders);
+      return res.json({ ok: true, scope: 'chat', ...result });
     }
-
-    res.json({
-      ok: true,
-      count: found.length,
-      scanned, // messages examined; useful when a sender filter is set
-      messages: found.map((m) => summarize(m, chatTitle)),
-    });
+    const result = await historyAcrossChats(limit, senders);
+    res.json({ ok: true, scope: 'all', ...result });
   } catch (e) {
     console.error('/history error:', e);
     res.status(500).json({ error: e.message });
