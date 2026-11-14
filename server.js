@@ -3,9 +3,9 @@
 const crypto = require('crypto');
 const express = require('express');
 const bigInt = require('big-integer');
-const { TelegramClient } = require('telegram');
+const { TelegramClient, utils } = require('telegram');
 const { StringSession } = require('telegram/sessions');
-const { NewMessage } = require('telegram/events');
+const { NewMessage, EditedMessage, DeletedMessage } = require('telegram/events');
 
 const {
   TG_API_ID,
@@ -16,6 +16,10 @@ const {
   N8N_WEBHOOK_SECRET = '',
   SELF_URL = '', // URL n8n should use to reach this service, e.g. http://project_tg-gateway:3000
   MAX_DOWNLOAD_MB = '50',
+  TRACKED_CHAT_IDS = '',   // comma-separated chat IDs. Caching and edit/delete reports only for these. Empty = all chats.
+  MSG_CACHE_SIZE = '5000', // how many tracked messages to remember for delete/edit reporting
+  PREFILL_DIALOGS = '30',  // chats to load into the cache at startup (when no TRACKED_CHAT_IDS)
+  PREFILL_PER_CHAT = '10', // messages per chat to load into the cache at startup
   PORT = '3000',
 } = process.env;
 
@@ -32,6 +36,31 @@ const client = new TelegramClient(
   TG_API_HASH,
   { connectionRetries: 10, autoReconnect: true },
 );
+
+/* ------------------------------ chat tracking ------------------------------ */
+
+const NUMERIC_ID_RE = /^-?\d+$/;
+
+// Drops the minus sign and the -100 channel prefix, so "2343434343", "-2343434343"
+// and "-1002343434343" all map to the same key.
+function bareChatId(id) {
+  const s = String(id).trim();
+  if (s.startsWith('-100')) return s.slice(4);
+  if (s.startsWith('-')) return s.slice(1);
+  return s;
+}
+
+const TRACKED = new Set();
+for (const raw of String(TRACKED_CHAT_IDS).split(',').map((s) => s.trim()).filter(Boolean)) {
+  if (!NUMERIC_ID_RE.test(raw)) {
+    console.error(`Invalid chat ID in TRACKED_CHAT_IDS: ${raw}`);
+    process.exit(1);
+  }
+  TRACKED.add(bareChatId(raw));
+}
+const TRACKING_ON = TRACKED.size > 0;
+
+const isTracked = (chatId) => !TRACKING_ON || TRACKED.has(bareChatId(chatId));
 
 /* ------------------------------ helpers ------------------------------ */
 
@@ -105,6 +134,8 @@ function toWATIso(unixSeconds) {
   return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}${WAT_OFFSET}`;
 }
 
+const nowWAT = () => toWATIso(Math.floor(Date.now() / 1000));
+
 function summarize(m, chatTitle) {
   const chatId = String(m.chatId);
   const type = mediaType(m);
@@ -139,9 +170,81 @@ function summarize(m, chatTitle) {
   };
 }
 
-/* ------------------------------ history helpers ------------------------------ */
+async function chatTitleOf(m) {
+  try {
+    const chat = await m.getChat();
+    return chat?.title || chat?.username || chat?.firstName || null;
+  } catch (_) {
+    return null;
+  }
+}
 
-const NUMERIC_ID_RE = /^-?\d+$/;
+// Marked chat ID string (e.g. "-1001234567890") from a Telegram peer object, or null.
+function peerIdOf(peer) {
+  if (!peer) return null;
+  try {
+    return String(utils.getPeerId(peer));
+  } catch (_) {
+    return null;
+  }
+}
+
+/* ------------------------------ message cache ------------------------------ */
+// Telegram does not send the text of deleted messages, and edit events carry only the new text.
+// This cache keeps recent messages from tracked chats so we can report what they said.
+// It lives in memory and is lost on restart.
+
+const MSG_CACHE_LIMIT = Number(MSG_CACHE_SIZE) || 5000;
+const messageCache = new Map(); // "chatId:messageId" -> summarized message
+
+const cacheKey = (chatId, messageId) => `${chatId}:${messageId}`;
+
+function remember(summary) {
+  if (!summary || !summary.chatId || !summary.messageId) return;
+  if (!isTracked(summary.chatId)) return; // only tracked chats are cached
+  const key = cacheKey(summary.chatId, summary.messageId);
+  messageCache.delete(key); // re-insert so this entry counts as the newest
+  messageCache.set(key, summary);
+  while (messageCache.size > MSG_CACHE_LIMIT) {
+    messageCache.delete(messageCache.keys().next().value); // evict the oldest
+  }
+}
+
+// With a chatId: the one cached message, or null.
+// Without a chatId: every cached message with that message ID (one per chat), as an array.
+function findCached(chatId, messageId) {
+  if (chatId) return messageCache.get(cacheKey(chatId, messageId)) || null;
+  const hits = [];
+  for (const v of messageCache.values()) {
+    if (String(v.messageId) === String(messageId)) hits.push(v);
+  }
+  return hits;
+}
+
+// Loads recent messages from tracked chats into the cache at startup, in the background.
+async function prefillCache() {
+  try {
+    const dialogs = await client.getDialogs({
+      limit: TRACKING_ON ? 300 : Number(PREFILL_DIALOGS) || 30,
+    });
+    const perChat = Number(PREFILL_PER_CHAT) || 10;
+    for (const d of dialogs) {
+      if (!d.inputEntity) continue;
+      if (!isTracked(String(d.id))) continue;
+      const title = d.title || d.name || null;
+      try {
+        for await (const m of client.iterMessages(d.inputEntity, { limit: perChat })) {
+          if (m?.id) remember(summarize(m, title));
+        }
+      } catch (_) {}
+    }
+    console.log(`Message cache primed with ${messageCache.size} messages`);
+  } catch (e) {
+    console.error('cache prefill failed:', e.message);
+  }
+}
+
+/* ------------------------------ history helpers ------------------------------ */
 
 const MAX_HISTORY_LIMIT = 500; // max messages returned per request
 const MAX_HISTORY_SCAN = 5000; // max messages examined per targeted chat
@@ -245,16 +348,16 @@ async function scanTarget(target, limit, senders, scanLimit) {
 
   let title = target.title;
   if (!title && matched.length) {
-    try {
-      const chat = await matched[0].getChat();
-      title = chat?.title || chat?.username || chat?.firstName || null;
-    } catch (_) {}
+    title = await chatTitleOf(matched[0]);
   }
+
+  const messages = matched.map((m) => summarize(m, title));
+  messages.forEach(remember); // remember() ignores untracked chats
 
   return {
     examined,
     chat: { chatId: target.key, title },
-    messages: matched.map((m) => summarize(m, title)),
+    messages,
   };
 }
 
@@ -323,17 +426,118 @@ async function postToN8n(payload) {
   }
 }
 
+// New message -> { type: "text", ...message }
+// Sent for every chat, so normal messages keep flowing even when tracking is limited.
 async function onNewMessage(event) {
   try {
     const m = event.message;
-    let title = null;
-    try {
-      const chat = await m.getChat();
-      title = chat?.title || chat?.username || chat?.firstName || null;
-    } catch (_) {}
-    await postToN8n(summarize(m, title));
+    const title = await chatTitleOf(m);
+    const summary = summarize(m, title);
+    remember(summary); // only stored if the chat is tracked
+    await postToN8n({ type: 'text', ...summary });
   } catch (e) {
     console.error('onNewMessage error:', e);
+  }
+}
+
+// Edited message -> { type: "edited", before, after }
+// Only reported for tracked chats. before is null if the original was never cached.
+async function onEditedMessage(event) {
+  try {
+    const m = event.message;
+    const chatId = String(m.chatId);
+    if (!isTracked(chatId)) return;
+
+    const before = messageCache.get(cacheKey(chatId, m.id)) || null;
+    const title = await chatTitleOf(m);
+    const after = summarize(m, title);
+    remember(after);
+
+    const snapshot = (s) => ({
+      messageId: s.messageId,
+      text: s.text,
+      senderId: s.senderId,
+      sentAt: s.sentAt,
+      hasMedia: s.hasMedia,
+      mediaType: s.mediaType,
+    });
+
+    await postToN8n({
+      type: 'edited',
+      chatId,
+      chatTitle: title,
+      detectedAt: nowWAT(),
+      editedAt: toWATIso(m.editDate),
+      sameMessageId: before ? String(before.messageId) === String(after.messageId) : null,
+      before: before ? snapshot(before) : null,
+      after: snapshot(after),
+    });
+  } catch (e) {
+    console.error('onEditedMessage error:', e);
+  }
+}
+
+// Deleted message -> { type: "deleted", messageId, chatId, content, ... }
+// Telegram sends only IDs. Content comes from the cache when the message was seen.
+async function onDeletedMessage(event) {
+  try {
+    const peerId = peerIdOf(event.peer);
+
+    // Known chat that is not tracked: ignore.
+    if (peerId && !isTracked(peerId)) return;
+
+    const detectedAt = nowWAT();
+
+    for (const rawId of event.deletedIds || []) {
+      const messageId = Number(rawId);
+      const found = findCached(peerId, messageId);
+
+      let original = null;
+      let candidates;
+      if (Array.isArray(found)) {
+        if (found.length === 1) original = found[0];
+        else if (found.length > 1) {
+          // Chat unknown and several cached messages share this ID: report each candidate.
+          candidates = found.map((s) => ({
+            chatId: s.chatId,
+            chatTitle: s.chatTitle,
+            senderId: s.senderId,
+            sentAt: s.sentAt,
+            text: s.text,
+          }));
+        }
+      } else {
+        original = found;
+      }
+
+      // Chat unknown and nothing cached: with tracking on we can't tell if the
+      // message was in a tracked chat, so skip it.
+      if (!peerId && TRACKING_ON && !original && !candidates) continue;
+
+      if (original) messageCache.delete(cacheKey(original.chatId, original.messageId));
+
+      await postToN8n({
+        type: 'deleted',
+        messageId,
+        chatId: peerId || original?.chatId || null,
+        chatTitle: original?.chatTitle ?? null,
+        chatInferred: !peerId && !!original, // true when the chat was matched by message ID only
+        detectedAt,
+        cached: !!original,
+        content: original
+          ? {
+              text: original.text,
+              senderId: original.senderId,
+              sentAt: original.sentAt,
+              hasMedia: original.hasMedia,
+              mediaType: original.mediaType,
+            }
+          : null,
+        candidates,
+      });
+    }
+  } catch (e) {
+    console.error('onDeletedMessage error:', e);
   }
 }
 
@@ -414,7 +618,9 @@ app.get('/messages', async (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 20, 100);
     if (!chatId) return res.status(400).json({ error: 'chatId is required' });
     const msgs = await withPeer(chatId, (peer) => client.getMessages(peer, { limit }));
-    res.json(msgs.map((m) => summarize(m)));
+    const out = msgs.map((m) => summarize(m));
+    out.forEach(remember);
+    res.json(out);
   } catch (e) {
     console.error('/messages error:', e);
     res.status(500).json({ error: e.message });
@@ -437,7 +643,8 @@ app.post('/history', async (req, res) => {
   let chatIds;
   let chatNames;
   let senders;
-  const hasSingleChat = body.chatId !== undefined && body.chatId !== null && String(body.chatId).trim() !== '';
+  const hasSingleChat =
+    body.chatId !== undefined && body.chatId !== null && String(body.chatId).trim() !== '';
 
   try {
     chatIds = parseChatIds([...toList(body.chatId), ...toList(body.chatIds)]);
@@ -479,8 +686,20 @@ app.post('/history', async (req, res) => {
   const me = await client.getMe();
   console.log(`Telegram connected as ${me.username || me.firstName} (${me.id})`);
 
+  console.log(
+    TRACKING_ON
+      ? `Tracking edits/deletes for ${TRACKED.size} chat(s): ${[...TRACKED].join(', ')}`
+      : 'Tracking edits/deletes for all chats',
+  );
+
   await warmEntityCache();
+
   client.addEventHandler(onNewMessage, new NewMessage({}));
+  client.addEventHandler(onEditedMessage, new EditedMessage({}));
+  client.addEventHandler(onDeletedMessage, new DeletedMessage({}));
+
+  // Fill the cache in the background so the server starts answering right away.
+  prefillCache();
 
   const server = app.listen(Number(PORT), () => console.log(`HTTP API listening on :${PORT}`));
 
