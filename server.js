@@ -82,6 +82,29 @@ function mediaType(m) {
   return null;
 }
 
+// Nigeria uses West Africa Time (UTC+1) all year, with no daylight saving.
+const WAT_OFFSET = '+01:00';
+
+const watParts = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Africa/Lagos',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hourCycle: 'h23',
+});
+
+// Unix seconds -> "2026-11-14T10:32:05+01:00"
+function toWATIso(unixSeconds) {
+  if (!unixSeconds) return null;
+  const p = Object.fromEntries(
+    watParts.formatToParts(new Date(Number(unixSeconds) * 1000)).map((x) => [x.type, x.value]),
+  );
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}${WAT_OFFSET}`;
+}
+
 function summarize(m, chatTitle) {
   const chatId = String(m.chatId);
   const type = mediaType(m);
@@ -92,7 +115,8 @@ function summarize(m, chatTitle) {
     chatTitle: chatTitle || null,
     senderId: m.senderId ? String(m.senderId) : null,
     out: !!m.out,
-    date: m.date,
+    date: m.date,              // Unix seconds (UTC), kept for sorting
+    sentAt: toWATIso(m.date),  // Nigerian time, e.g. "2026-11-14T10:32:05+01:00"
     text: m.message || '',
     hasMedia: !!type,
     mediaType: type,
@@ -117,92 +141,164 @@ function summarize(m, chatTitle) {
 
 /* ------------------------------ history helpers ------------------------------ */
 
-const MAX_HISTORY_LIMIT = 500;   // max messages returned per request
-const MAX_HISTORY_SCAN = 5000;   // max messages examined when a single chat is requested
-const MAX_DIALOGS = 50;          // chats examined when no chatId is given
-const MAX_SCAN_PER_CHAT = 500;   // messages examined per chat in all-chats mode, when filtering by sender
+const NUMERIC_ID_RE = /^-?\d+$/;
+
+const MAX_HISTORY_LIMIT = 500; // max messages returned per request
+const MAX_HISTORY_SCAN = 5000; // max messages examined per targeted chat
+const MAX_DIALOGS = 50;        // chats searched when no filter is given
+const MAX_NAME_LOOKUP = 300;   // dialogs loaded when matching chatNames
+const MAX_SCAN_PER_CHAT = 500; // messages examined per chat in all-chats mode, when filtering by sender
+
+// Accepts undefined, null, a single value, or an array. Always returns an array.
+function toList(v) {
+  if (v === undefined || v === null || v === '') return [];
+  return Array.isArray(v) ? v : [v];
+}
 
 // [123, "456"] -> Set("123", "456"). Missing, null or empty -> null (no sender filter).
-// Throws on anything that is not an array of numeric IDs.
 function parseSenderIds(input) {
-  if (input === undefined || input === null) return null;
-  if (!Array.isArray(input)) throw new Error('senderIds must be an array');
-  const ids = input.map((v) => String(v).trim()).filter(Boolean);
-  const bad = ids.find((id) => !/^\d+$/.test(id));
+  const ids = toList(input).map((v) => String(v).trim()).filter(Boolean);
+  if (!ids.length) return null;
+  const bad = ids.find((id) => !NUMERIC_ID_RE.test(id));
   if (bad) throw new Error(`invalid Telegram ID in senderIds: ${bad}`);
-  return ids.length ? new Set(ids) : null;
+  return new Set(ids);
+}
+
+// Returns a de-duplicated array of numeric chat ID strings.
+function parseChatIds(input) {
+  const ids = toList(input).map((v) => String(v).trim()).filter(Boolean);
+  const bad = ids.find((id) => !NUMERIC_ID_RE.test(id));
+  if (bad) throw new Error(`invalid Telegram ID in chatIds: ${bad}`);
+  return [...new Set(ids)];
+}
+
+// Returns an array of non-empty chat-name strings.
+function parseChatNames(input) {
+  return toList(input).map((v) => String(v).trim()).filter(Boolean);
 }
 
 function clampLimit(raw) {
   return Math.min(Math.max(parseInt(raw, 10) || 20, 1), MAX_HISTORY_LIMIT);
 }
 
-// Last `limit` messages in one chat, newest first.
-async function historyForChat(chatId, limit, senders) {
-  const { found, scanned } = await withPeer(chatId, async (peer) => {
+// Works out which chats to search.
+// Returns { targets: [{ key, peer, title }], targeted: boolean }.
+// peer is a numeric ID string (resolved via withPeer) or a GramJS input entity from a dialog.
+async function resolveTargets(chatIds, chatNames) {
+  // No filter: the most recent dialogs.
+  if (!chatIds.length && !chatNames.length) {
+    const dialogs = await client.getDialogs({ limit: MAX_DIALOGS });
+    const targets = [];
+    for (const d of dialogs) {
+      if (!d.inputEntity) continue;
+      targets.push({
+        key: String(d.id),
+        peer: d.inputEntity,
+        title: d.title || d.name || null,
+      });
+    }
+    return { targets, targeted: false };
+  }
+
+  const targets = new Map();
+
+  for (const id of chatIds) {
+    targets.set(id, { key: id, peer: id, title: null });
+  }
+
+  if (chatNames.length) {
+    const needles = chatNames.map((n) => n.toLowerCase());
+    const dialogs = await client.getDialogs({ limit: MAX_NAME_LOOKUP });
+    for (const d of dialogs) {
+      const title = d.title || d.name || '';
+      if (!d.inputEntity || !title) continue;
+      const lower = title.toLowerCase();
+      if (needles.some((n) => lower.includes(n))) {
+        const key = String(d.id);
+        if (!targets.has(key)) {
+          targets.set(key, { key, peer: d.inputEntity, title });
+        }
+      }
+    }
+  }
+
+  return { targets: [...targets.values()], targeted: true };
+}
+
+// Scans one chat and returns up to `limit` matching messages, newest first.
+async function scanTarget(target, limit, senders, scanLimit) {
+  const run = async (peer) => {
     const matched = [];
     let examined = 0;
-    for await (const m of client.iterMessages(peer, { limit: MAX_HISTORY_SCAN })) {
+    for await (const m of client.iterMessages(peer, { limit: scanLimit })) {
       examined++;
       if (!m || !m.id) continue;
       if (senders && !senders.has(String(m.senderId))) continue;
       matched.push(m);
       if (matched.length >= limit) break;
     }
-    return { found: matched, scanned: examined };
-  });
+    return { matched, examined };
+  };
 
-  let chatTitle = null;
-  if (found.length) {
+  const { matched, examined } =
+    typeof target.peer === 'string' ? await withPeer(target.peer, run) : await run(target.peer);
+
+  let title = target.title;
+  if (!title && matched.length) {
     try {
-      const chat = await found[0].getChat();
-      chatTitle = chat?.title || chat?.username || chat?.firstName || null;
+      const chat = await matched[0].getChat();
+      title = chat?.title || chat?.username || chat?.firstName || null;
     } catch (_) {}
   }
 
   return {
-    count: found.length,
-    scanned,
-    messages: found.map((m) => summarize(m, chatTitle)),
+    examined,
+    chat: { chatId: target.key, title },
+    messages: matched.map((m) => summarize(m, title)),
   };
 }
 
-// Last `limit` messages across the most recent chats, newest first.
-async function historyAcrossChats(limit, senders) {
-  const dialogs = await client.getDialogs({ limit: MAX_DIALOGS });
+// Searches the resolved chats and merges the results, newest first.
+async function searchHistory({ chatIds, chatNames, limit, senders }) {
+  const { targets, targeted } = await resolveTargets(chatIds, chatNames);
+
+  const scanLimit = senders
+    ? targeted
+      ? MAX_HISTORY_SCAN
+      : MAX_SCAN_PER_CHAT
+    : limit;
+
   const collected = [];
+  const chats = [];
+  const errors = [];
   let scanned = 0;
 
-  for (const d of dialogs) {
-    if (!d.inputEntity) continue;
-    const title = d.title || d.name || null;
-    const perChat = [];
-    let examined = 0;
-
+  for (const target of targets) {
     try {
-      const scanLimit = senders ? MAX_SCAN_PER_CHAT : limit;
-      for await (const m of client.iterMessages(d.inputEntity, { limit: scanLimit })) {
-        examined++;
-        if (!m || !m.id) continue;
-        if (senders && !senders.has(String(m.senderId))) continue;
-        perChat.push(summarize(m, title));
-        if (perChat.length >= limit) break;
-      }
+      const r = await scanTarget(target, limit, senders, scanLimit);
+      scanned += r.examined;
+      collected.push(...r.messages);
+      chats.push(r.chat);
     } catch (e) {
-      console.error(`history scan failed for "${title}":`, e.message);
-      continue;
+      console.error(`history scan failed for ${target.title || target.key}:`, e.message);
+      errors.push({ chatId: target.key, title: target.title, error: e.message });
     }
-
-    scanned += examined;
-    collected.push(...perChat);
   }
 
-  collected.sort((a, b) => b.date - a.date);
-  const messages = collected.slice(0, limit);
-  return { count: messages.length, scanned, messages };
-}
+  // Remove duplicates in case a chat matched by ID and by name.
+  const seen = new Set();
+  const unique = collected.filter((m) => {
+    const k = `${m.chatId}:${m.messageId}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
 
-const NUMERIC_ID_RE = /^-?\d+$/;
+  unique.sort((a, b) => b.date - a.date);
+  const messages = unique.slice(0, limit);
+
+  return { count: messages.length, scanned, messages, chats, errors };
+}
 
 /* ------------------------- incoming -> n8n webhook ------------------------- */
 
@@ -325,36 +421,47 @@ app.get('/messages', async (req, res) => {
   }
 });
 
-// POST /history  { chatId?, limit?, senderIds? }
-// With chatId: the most recent `limit` messages in that chat, newest first.
-// Without chatId: the most recent `limit` messages across your recent chats, newest first.
-// If senderIds is a non-empty array, only messages from those Telegram user IDs are returned.
+// POST /history
+// Body (all optional):
+//   chatId:    one numeric chat ID                       -> that chat only
+//   chatIds:   array of numeric chat IDs                 -> only those chats
+//   chatNames: array of strings, case-insensitive match  -> chats whose title contains any of them
+//   senderIds: array of numeric Telegram user IDs        -> only messages from those users
+//   limit:     number of messages to return (default 20, max 500)
+//
+// With no chat filter, the search covers your most recent chats.
+// chatIds and chatNames can be combined; the result is the union of matching chats.
 app.post('/history', async (req, res) => {
-  const { chatId: rawChatId, limit: rawLimit, senderIds: rawSenderIds } = req.body || {};
+  const body = req.body || {};
 
-  const chatId =
-    rawChatId === undefined || rawChatId === null ? '' : String(rawChatId).trim();
-
-  if (chatId && !NUMERIC_ID_RE.test(chatId)) {
-    return res.status(400).json({ error: 'chatId must be a numeric Telegram ID' });
-  }
-
+  let chatIds;
+  let chatNames;
   let senders;
+  const hasSingleChat = body.chatId !== undefined && body.chatId !== null && String(body.chatId).trim() !== '';
+
   try {
-    senders = parseSenderIds(rawSenderIds);
+    chatIds = parseChatIds([...toList(body.chatId), ...toList(body.chatIds)]);
+    chatNames = parseChatNames(body.chatNames);
+    senders = parseSenderIds(body.senderIds);
   } catch (e) {
     return res.status(400).json({ error: e.message });
   }
 
-  const limit = clampLimit(rawLimit);
+  const limit = clampLimit(body.limit);
+
+  let scope = 'all';
+  if (chatIds.length || chatNames.length) {
+    scope = hasSingleChat && chatIds.length === 1 && !chatNames.length ? 'chat' : 'filtered';
+  }
 
   try {
-    if (chatId) {
-      const result = await historyForChat(chatId, limit, senders);
-      return res.json({ ok: true, scope: 'chat', ...result });
+    const result = await searchHistory({ chatIds, chatNames, limit, senders });
+
+    if (scope === 'chat' && result.errors.length) {
+      return res.status(500).json({ error: result.errors[0].error });
     }
-    const result = await historyAcrossChats(limit, senders);
-    res.json({ ok: true, scope: 'all', ...result });
+
+    res.json({ ok: true, scope, ...result });
   } catch (e) {
     console.error('/history error:', e);
     res.status(500).json({ error: e.message });
