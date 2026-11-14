@@ -6,9 +6,7 @@ const bigInt = require('big-integer');
 const { TelegramClient } = require('telegram');
 const { StringSession } = require('telegram/sessions');
 const { NewMessage } = require('telegram/events');
-const { getPeerId } = require('telegram/Utils');
 
-const env = process.env;
 const {
   TG_API_ID,
   TG_API_HASH,
@@ -16,18 +14,24 @@ const {
   API_KEY,
   N8N_WEBHOOK_URL = '',
   N8N_WEBHOOK_SECRET = '',
-  SELF_URL = '', // how n8n reaches this service, e.g. http://project_service:3000
+  SELF_URL = '', // URL n8n should use to reach this service, e.g. http://project_tg-gateway:3000
   MAX_DOWNLOAD_MB = '50',
   PORT = '3000',
-} = env;
+} = process.env;
 
-// true  = also forward messages sent FROM your account (incl. ones sent via /send)
-const SEND_OUTGOING = (env.SEND_OUTGOING ?? 'true') !== 'false';
-// true  = put the file itself (base64) in the webhook payload, not just the downloadUrl
-const EMBED_MEDIA = env.EMBED_MEDIA === 'true';
-const EMBED_MAX_BYTES = Number(env.EMBED_MAX_MB || 8) * 1024 * 1024;
+for (const [k, v] of Object.entries({ TG_API_ID, TG_API_HASH, TG_SESSION, API_KEY })) {
+  if (!v) {
+    console.error(`Missing required env var: ${k}`);
+    process.exit(1);
+  }
+}
 
-let client = null;
+const client = new TelegramClient(
+  new StringSession(TG_SESSION),
+  Number(TG_API_ID),
+  TG_API_HASH,
+  { connectionRetries: 10, autoReconnect: true },
+);
 
 /* ------------------------------ helpers ------------------------------ */
 
@@ -68,133 +72,66 @@ async function getMessage(chatId, messageId) {
   return msg || null;
 }
 
-// Describes a Telegram entity: type is one of user | bot | group | channel
-function entityInfo(e) {
-  if (!e) return null;
-  const cls = e.className || '';
-  let type = 'unknown';
-  if (cls.startsWith('User')) type = e.bot ? 'bot' : 'user';
-  else if (cls.startsWith('Chat')) type = 'group';
-  else if (cls.startsWith('Channel')) type = e.broadcast ? 'channel' : 'group';
-
-  let id = null;
-  try {
-    id = String(getPeerId(e));
-  } catch (_) {
-    id = e.id != null ? String(e.id) : null;
-  }
-  return {
-    id,
-    type,
-    isSupergroup: cls === 'Channel' && !!e.megagroup,
-    isSelf: !!e.self,
-    name: e.title || [e.firstName, e.lastName].filter(Boolean).join(' ') || null,
-    username: e.username || null,
-  };
-}
-
-function mediaKind(m) {
-  // Link previews look like photos to GramJS; they are not real attachments.
-  if (!m.media || m.media.className === 'MessageMediaWebPage') return null;
+function mediaType(m) {
   if (m.photo) return 'photo';
-  if (m.sticker) return 'sticker';
-  if (m.gif) return 'gif';
   if (m.video) return 'video';
   if (m.voice) return 'voice';
   if (m.audio) return 'audio';
+  if (m.sticker) return 'sticker';
   if (m.document) return 'document';
   return null;
 }
 
-/* ------------------------------ payload ------------------------------ */
-
-async function buildPayload(m, opts = {}) {
-  const { includeReply = true, embed = true, chatId: chatIdFallback } = opts;
-
-  const [chatE, senderE] = await Promise.all([
-    Promise.resolve().then(() => m.getChat()).catch(() => null),
-    Promise.resolve().then(() => m.getSender()).catch(() => null),
-  ]);
-
-  const chat = entityInfo(chatE) || { id: null, type: 'unknown', name: null, username: null };
-  const chatId = String(m.chatId ?? chatIdFallback ?? chat.id);
-  chat.id = chat.id || chatId;
-
-  const sender =
-    entityInfo(senderE) ||
-    (m.senderId ? { id: String(m.senderId), type: 'unknown', name: null, username: null } : null);
-
-  const kind = mediaKind(m);
-  const file = kind ? m.file : null;
-  const fileSize = file?.size ? Number(file.size) : null;
-  const text = m.message || '';
-
-  const payload = {
+function summarize(m, chatTitle) {
+  const chatId = String(m.chatId);
+  const type = mediaType(m);
+  const fwd = m.fwdFrom;
+  return {
     messageId: m.id,
-    date: m.date,
-    direction: m.out ? 'outgoing' : 'incoming',
-    out: !!m.out,
     chatId,
-    chat,
-    sender,
-    text,
-    caption: kind ? text || null : null, // text sent together with an image/file
-    mentioned: !!m.mentioned,
-    hasMedia: !!kind,
-    mediaType: kind,
-    fileName: file?.name || null,
-    mimeType: file?.mimeType || (kind === 'photo' ? 'image/jpeg' : null),
-    fileSize,
-    downloadUrl:
-      kind && SELF_URL
-        ? `${SELF_URL.replace(/\/$/, '')}/download?chatId=${chatId}&messageId=${m.id}`
-        : null,
-    groupedId: m.groupedId ? String(m.groupedId) : null, // same value = same album
-    isReply: !!m.replyTo?.replyToMsgId,
+    chatTitle: chatTitle || null,
+    senderId: m.senderId ? String(m.senderId) : null,
+    out: !!m.out,
+    date: m.date,
+    text: m.message || '',
+    hasMedia: !!type,
+    mediaType: type,
+    fileName: m.file?.name || null,
+    mimeType: m.file?.mimeType || (m.photo ? 'image/jpeg' : null),
+    fileSize: m.file?.size ? Number(m.file.size) : null,
     replyToMessageId: m.replyTo?.replyToMsgId ?? null,
-    forwardedFrom: m.fwdFrom
+    forwardedFrom: fwd
       ? {
-          channelId: m.fwdFrom.fromId?.channelId ? String(m.fwdFrom.fromId.channelId) : null,
-          userId: m.fwdFrom.fromId?.userId ? String(m.fwdFrom.fromId.userId) : null,
-          name: m.fwdFrom.fromName || null,
-          channelPost: m.fwdFrom.channelPost ?? null,
-          date: m.fwdFrom.date ?? null,
+          channelId: fwd.fromId?.channelId ? String(fwd.fromId.channelId) : null,
+          userId: fwd.fromId?.userId ? String(fwd.fromId.userId) : null,
+          channelPost: fwd.channelPost ?? null,
+          date: fwd.date ?? null,
         }
       : null,
-    replyTo: null,
+    downloadUrl:
+      type && SELF_URL
+        ? `${SELF_URL.replace(/\/$/, '')}/download?chatId=${chatId}&messageId=${m.id}`
+        : null,
   };
-
-  // Optionally ship the file itself inside the webhook payload
-  if (embed && EMBED_MEDIA && kind) {
-    const okSize = fileSize ? fileSize <= EMBED_MAX_BYTES : kind === 'photo';
-    if (okSize) {
-      try {
-        const buf = await client.downloadMedia(m, {});
-        if (buf) payload.base64 = buf.toString('base64');
-      } catch (e) {
-        console.error('embed download failed:', e.message);
-      }
-    }
-  }
-
-  // Attach the message this one replies to
-  if (includeReply && payload.isReply) {
-    try {
-      const r = await m.getReplyMessage();
-      if (r && r.className !== 'MessageService') {
-        payload.replyTo = await buildPayload(r, {
-          includeReply: false,
-          embed: false,
-          chatId,
-        });
-      }
-    } catch (e) {
-      console.error('reply fetch failed:', e.message);
-    }
-  }
-
-  return payload;
 }
+
+/* ------------------------------ history helpers ------------------------------ */
+
+const MAX_HISTORY_LIMIT = 500; // max messages returned per request
+const MAX_HISTORY_SCAN = 5000; // max messages examined per request (caps Telegram API calls)
+
+// [123, "456"] -> Set("123", "456"). Missing, null or empty -> null (no sender filter).
+// Throws on anything that is not an array of numeric IDs.
+function parseSenderIds(input) {
+  if (input === undefined || input === null) return null;
+  if (!Array.isArray(input)) throw new Error('senderIds must be an array');
+  const ids = input.map((v) => String(v).trim()).filter(Boolean);
+  const bad = ids.find((id) => !/^\d+$/.test(id));
+  if (bad) throw new Error(`invalid Telegram ID in senderIds: ${bad}`);
+  return ids.length ? new Set(ids) : null;
+}
+
+const NUMERIC_ID_RE = /^-?\d+$/;
 
 /* ------------------------- incoming -> n8n webhook ------------------------- */
 
@@ -222,8 +159,12 @@ async function postToN8n(payload) {
 async function onNewMessage(event) {
   try {
     const m = event.message;
-    if (!SEND_OUTGOING && m.out) return;
-    await postToN8n(await buildPayload(m));
+    let title = null;
+    try {
+      const chat = await m.getChat();
+      title = chat?.title || chat?.username || chat?.firstName || null;
+    } catch (_) {}
+    await postToN8n(summarize(m, title));
   } catch (e) {
     console.error('onNewMessage error:', e);
   }
@@ -235,16 +176,17 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 app.get('/health', (_req, res) => {
-  res.status(client?.connected ? 200 : 503).json({ ok: !!client?.connected });
+  res.status(client.connected ? 200 : 503).json({ ok: !!client.connected });
 });
 
 app.use((req, res, next) => {
   const key = req.get('x-api-key') || '';
-  if (!API_KEY || !safeEq(key, API_KEY)) return res.status(401).json({ error: 'unauthorized' });
+  if (!safeEq(key, API_KEY)) return res.status(401).json({ error: 'unauthorized' });
   next();
 });
 
 // GET /download?chatId=...&messageId=...[&format=base64]
+// Returns the file bytes (photo/video/document). With format=base64 returns JSON.
 app.get('/download', async (req, res) => {
   try {
     const { chatId, messageId, format } = req.query;
@@ -287,10 +229,10 @@ app.post('/send', async (req, res) => {
   try {
     const { chatId, text, replyTo } = req.body || {};
     if (!chatId || !text) return res.status(400).json({ error: 'chatId and text are required' });
-    const sendFn = (peer) => client.sendMessage(peer, { message: text, replyTo });
-    const sent = /^-?\d+$/.test(String(chatId))
-      ? await withPeer(chatId, sendFn)
-      : await sendFn(String(chatId));
+    const peerFn = (peer) => client.sendMessage(peer, { message: text, replyTo });
+    const sent = NUMERIC_ID_RE.test(String(chatId))
+      ? await withPeer(chatId, peerFn)
+      : await peerFn(String(chatId));
     res.json({ ok: true, messageId: sent.id });
   } catch (e) {
     console.error('/send error:', e);
@@ -298,38 +240,77 @@ app.post('/send', async (req, res) => {
   }
 });
 
-// GET /messages?chatId=...&limit=20[&withReply=true]
+// GET /messages?chatId=...&limit=20
 app.get('/messages', async (req, res) => {
   try {
     const { chatId } = req.query;
     const limit = Math.min(Number(req.query.limit) || 20, 100);
     if (!chatId) return res.status(400).json({ error: 'chatId is required' });
     const msgs = await withPeer(chatId, (peer) => client.getMessages(peer, { limit }));
-    const withReply = req.query.withReply === 'true';
-    res.json(
-      await Promise.all(msgs.map((m) => buildPayload(m, { includeReply: withReply, embed: false }))),
-    );
+    res.json(msgs.map((m) => summarize(m)));
   } catch (e) {
     console.error('/messages error:', e);
     res.status(500).json({ error: e.message });
   }
 });
 
-/* ---------------------------------- boot ---------------------------------- */
+// POST /history  { chatId, limit?, senderIds? }
+// Returns the most recent `limit` messages in the chat (newest first).
+// If senderIds is a non-empty array, only messages from those Telegram user IDs are returned.
+app.post('/history', async (req, res) => {
+  const { chatId, limit: rawLimit, senderIds: rawSenderIds } = req.body || {};
 
-async function main() {
-  for (const [k, v] of Object.entries({ TG_API_ID, TG_API_HASH, TG_SESSION, API_KEY })) {
-    if (!v) {
-      console.error(`Missing required env var: ${k}`);
-      process.exit(1);
-    }
+  if (!chatId) return res.status(400).json({ error: 'chatId is required' });
+  if (!NUMERIC_ID_RE.test(String(chatId))) {
+    return res.status(400).json({ error: 'chatId must be a numeric Telegram ID' });
   }
 
-  client = new TelegramClient(new StringSession(TG_SESSION), Number(TG_API_ID), TG_API_HASH, {
-    connectionRetries: 10,
-    autoReconnect: true,
-  });
+  let senders;
+  try {
+    senders = parseSenderIds(rawSenderIds);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
 
+  const limit = Math.min(Math.max(parseInt(rawLimit, 10) || 20, 1), MAX_HISTORY_LIMIT);
+
+  try {
+    const { found, scanned } = await withPeer(chatId, async (peer) => {
+      const matched = [];
+      let examined = 0;
+      for await (const m of client.iterMessages(peer, { limit: MAX_HISTORY_SCAN })) {
+        examined++;
+        if (!m || !m.id) continue;
+        if (senders && !senders.has(String(m.senderId))) continue;
+        matched.push(m);
+        if (matched.length >= limit) break;
+      }
+      return { found: matched, scanned: examined };
+    });
+
+    let chatTitle = null;
+    if (found.length) {
+      try {
+        const chat = await found[0].getChat();
+        chatTitle = chat?.title || chat?.username || chat?.firstName || null;
+      } catch (_) {}
+    }
+
+    res.json({
+      ok: true,
+      count: found.length,
+      scanned, // messages examined; useful when a sender filter is set
+      messages: found.map((m) => summarize(m, chatTitle)),
+    });
+  } catch (e) {
+    console.error('/history error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------------------------------- boot ---------------------------------- */
+
+(async () => {
   await client.connect();
   if (!(await client.checkAuthorization())) {
     console.error('Session is not authorized. Re-run generate-session.js and update TG_SESSION.');
@@ -350,13 +331,7 @@ async function main() {
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
-}
-
-if (require.main === module) {
-  main().catch((e) => {
-    console.error('Fatal startup error:', e);
-    process.exit(1);
-  });
-}
-
-module.exports = { buildPayload, entityInfo, mediaKind };
+})().catch((e) => {
+  console.error('Fatal startup error:', e);
+  process.exit(1);
+});
