@@ -7,39 +7,29 @@ const { TelegramClient, Api, utils } = require('telegram');
 const { StringSession } = require('telegram/sessions');
 const { NewMessage, Raw } = require('telegram/events');
 
+const env = process.env;
 const {
-  TG_API_ID,
-  TG_API_HASH,
-  TG_SESSION,
+  TG_API_ID = '',
+  TG_API_HASH = '',
   API_KEY,
   N8N_WEBHOOK_URL = '',
   N8N_WEBHOOK_SECRET = '',
   SELF_URL = '', // URL n8n should use to reach this service, e.g. http://project_tg-gateway:3000
   MAX_DOWNLOAD_MB = '50',
-  TRACKED_CHAT_IDS = '',   // comma-separated chat IDs. Caching and edit/delete reports only for these. Empty = all chats.
-  MSG_CACHE_SIZE = '5000', // how many tracked messages to remember for delete/edit reporting
-  PREFILL_DIALOGS = '30',  // chats to load into the cache at startup (when no TRACKED_CHAT_IDS)
-  PREFILL_PER_CHAT = '10', // messages per chat to load into the cache at startup
+  MSG_CACHE_SIZE = '5000', // tracked messages remembered for delete/edit reporting (all accounts)
+  PREFILL_DIALOGS = '30',
+  PREFILL_PER_CHAT = '10',
   PORT = '3000',
-} = process.env;
+} = env;
 
-for (const [k, v] of Object.entries({ TG_API_ID, TG_API_HASH, TG_SESSION, API_KEY })) {
-  if (!v) {
-    console.error(`Missing required env var: ${k}`);
-    process.exit(1);
-  }
+if (!API_KEY) {
+  console.error('Missing required env var: API_KEY');
+  process.exit(1);
 }
 
-const client = new TelegramClient(
-  new StringSession(TG_SESSION),
-  Number(TG_API_ID),
-  TG_API_HASH,
-  { connectionRetries: 10, autoReconnect: true },
-);
-
-/* ------------------------------ chat tracking ------------------------------ */
-
 const NUMERIC_ID_RE = /^-?\d+$/;
+
+/* ------------------------------ chat ID helpers ------------------------------ */
 
 // Drops the minus sign and the -100 channel prefix, so "2343434343", "-2343434343"
 // and "-1002343434343" all map to the same key.
@@ -50,17 +40,95 @@ function bareChatId(id) {
   return s;
 }
 
-const TRACKED = new Set();
-for (const raw of String(TRACKED_CHAT_IDS).split(',').map((s) => s.trim()).filter(Boolean)) {
-  if (!NUMERIC_ID_RE.test(raw)) {
-    console.error(`Invalid chat ID in TRACKED_CHAT_IDS: ${raw}`);
-    process.exit(1);
+function parseTrackedIds(raw, label) {
+  const ids = String(raw || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const id of ids) {
+    if (!NUMERIC_ID_RE.test(id)) {
+      throw new Error(`Invalid chat ID in tracked list for ${label}: ${id}`);
+    }
   }
-  TRACKED.add(bareChatId(raw));
+  return new Set(ids.map(bareChatId));
 }
-const TRACKING_ON = TRACKED.size > 0;
 
-const isTracked = (chatId) => !TRACKING_ON || TRACKED.has(bareChatId(chatId));
+// Empty tracked set = track every chat for that account.
+function isTracked(acct, chatId) {
+  return !acct.tracked.size || acct.tracked.has(bareChatId(chatId));
+}
+
+/* ------------------------------ account setup ------------------------------ */
+
+// Reads TG_SESSION_1, TG_SESSION_2, ... Plain TG_SESSION still works as a single account.
+function readAccountConfigs() {
+  const nums = Object.keys(env)
+    .map((k) => /^TG_SESSION_(\d+)$/.exec(k))
+    .filter(Boolean)
+    .map((m) => m[1])
+    .sort((a, b) => Number(a) - Number(b));
+
+  const suffixes = nums.length ? nums.map((n) => `_${n}`) : env.TG_SESSION ? [''] : [];
+  if (!suffixes.length) throw new Error('No accounts configured: set TG_SESSION_1 (or TG_SESSION)');
+
+  return suffixes.map((sfx, i) => {
+    const session = env[`TG_SESSION${sfx}`];
+    const apiId = env[`TG_API_ID${sfx}`] || TG_API_ID;
+    const apiHash = env[`TG_API_HASH${sfx}`] || TG_API_HASH;
+    const label = env[`TG_LABEL${sfx}`] || `account${i + 1}`;
+
+    if (!session) throw new Error(`Missing TG_SESSION${sfx}`);
+    if (!apiId || !apiHash) {
+      throw new Error(`Missing TG_API_ID${sfx} / TG_API_HASH${sfx} (or the shared TG_API_ID / TG_API_HASH)`);
+    }
+    if (!NUMERIC_ID_RE.test(String(apiId))) throw new Error(`TG_API_ID${sfx} must be numeric`);
+
+    return {
+      label,
+      session,
+      apiId: Number(apiId),
+      apiHash,
+      trackedRaw: sfx ? env[`TRACKED_CHAT_IDS${sfx}`] : env.TRACKED_CHAT_IDS,
+    };
+  });
+}
+
+function buildAccounts() {
+  const seen = new Set();
+  return readAccountConfigs().map((cfg, i) => {
+    if (seen.has(cfg.label)) throw new Error(`Duplicate account label: ${cfg.label}`);
+    seen.add(cfg.label);
+    return {
+      key: String(i + 1),
+      label: cfg.label,
+      id: null,         // Telegram user ID, filled in after login
+      connected: false,
+      tracked: parseTrackedIds(cfg.trackedRaw, cfg.label),
+      dialogsWarmed: false,
+      client: new TelegramClient(
+        new StringSession(cfg.session),
+        cfg.apiId,
+        cfg.apiHash,
+        { connectionRetries: 10, autoReconnect: true },
+      ),
+    };
+  });
+}
+
+let accounts;
+try {
+  accounts = buildAccounts();
+} catch (e) {
+  console.error(e.message);
+  process.exit(1);
+}
+
+// Picks an account by label, Telegram ID, or internal key. Empty = first account.
+function pickAccount(value) {
+  if (value === undefined || value === null || value === '') return accounts[0];
+  const v = String(value).trim();
+  return accounts.find((a) => a.label === v || a.id === v || a.key === v) || null;
+}
 
 /* ------------------------------ helpers ------------------------------ */
 
@@ -70,33 +138,32 @@ const safeEq = (a, b) => {
   return A.length === B.length && crypto.timingSafeEqual(A, B);
 };
 
-let dialogsWarmed = false;
-async function warmEntityCache() {
+async function warmEntityCache(acct) {
   try {
-    await client.getDialogs({ limit: 300 });
-    dialogsWarmed = true;
+    await acct.client.getDialogs({ limit: 300 });
+    acct.dialogsWarmed = true;
   } catch (e) {
-    console.error('getDialogs failed:', e.message);
+    console.error(`[${acct.label}] getDialogs failed:`, e.message);
   }
 }
 
 // Runs fn(peer); if Telegram doesn't know the peer yet, load dialogs and retry once.
-async function withPeer(chatId, fn) {
+async function withPeer(acct, chatId, fn) {
   const peer = bigInt(String(chatId));
   try {
     return await fn(peer);
   } catch (e) {
-    if (!dialogsWarmed || /Could not find the input entity/i.test(e.message)) {
-      await warmEntityCache();
+    if (!acct.dialogsWarmed || /Could not find the input entity/i.test(e.message)) {
+      await warmEntityCache(acct);
       return fn(peer);
     }
     throw e;
   }
 }
 
-async function getMessage(chatId, messageId) {
-  const [msg] = await withPeer(chatId, (peer) =>
-    client.getMessages(peer, { ids: [Number(messageId)] }),
+async function getMessage(acct, chatId, messageId) {
+  const [msg] = await withPeer(acct, chatId, (peer) =>
+    acct.client.getMessages(peer, { ids: [Number(messageId)] }),
   );
   return msg || null;
 }
@@ -136,18 +203,20 @@ function toWATIso(unixSeconds) {
 
 const nowWAT = () => toWATIso(Math.floor(Date.now() / 1000));
 
-function summarize(m, chatTitle) {
+function summarize(acct, m, chatTitle) {
   const chatId = String(m.chatId);
   const type = mediaType(m);
   const fwd = m.fwdFrom;
   return {
+    accountLabel: acct.label,   // which account received this event
+    accountId: acct.id,         // that account's Telegram user ID
     messageId: m.id,
     chatId,
     chatTitle: chatTitle || null,
     senderId: m.senderId ? String(m.senderId) : null,
     out: !!m.out,
-    date: m.date,              // Unix seconds (UTC), kept for sorting
-    sentAt: toWATIso(m.date),  // Nigerian time, e.g. "2026-11-14T10:32:05+01:00"
+    date: m.date,               // Unix seconds (UTC), kept for sorting
+    sentAt: toWATIso(m.date),   // Nigerian time, e.g. "2026-11-14T10:32:05+01:00"
     text: m.message || '',
     hasMedia: !!type,
     mediaType: type,
@@ -165,7 +234,7 @@ function summarize(m, chatTitle) {
       : null,
     downloadUrl:
       type && SELF_URL
-        ? `${SELF_URL.replace(/\/$/, '')}/download?chatId=${chatId}&messageId=${m.id}`
+        ? `${SELF_URL.replace(/\/$/, '')}/download?chatId=${chatId}&messageId=${m.id}&account=${encodeURIComponent(acct.label)}`
         : null,
   };
 }
@@ -191,56 +260,55 @@ function peerIdOf(peer) {
 
 /* ------------------------------ message cache ------------------------------ */
 // Telegram does not send the text of deleted messages, and edit events carry only the new text.
-// This cache keeps recent messages from tracked chats so we can report what they said.
-// It lives in memory and is lost on restart.
+// This cache keeps recent messages from tracked chats, per account, so we can report what they said.
+// Lives in memory and is lost on restart.
 
 const MSG_CACHE_LIMIT = Number(MSG_CACHE_SIZE) || 5000;
-const messageCache = new Map(); // "chatId:messageId" -> summarized message
+const messageCache = new Map(); // "accountKey:chatId:messageId" -> summarized message
 
-const cacheKey = (chatId, messageId) => `${chatId}:${messageId}`;
+const cacheKey = (acctKey, chatId, messageId) => `${acctKey}:${chatId}:${messageId}`;
 
-function remember(summary) {
+function remember(acct, summary) {
   if (!summary || !summary.chatId || !summary.messageId) return;
-  if (!isTracked(summary.chatId)) return; // only tracked chats are cached
-  const key = cacheKey(summary.chatId, summary.messageId);
+  if (!isTracked(acct, summary.chatId)) return;
+  const key = cacheKey(acct.key, summary.chatId, summary.messageId);
   messageCache.delete(key); // re-insert so this entry counts as the newest
-  messageCache.set(key, summary);
+  messageCache.set(key, { ...summary, _acct: acct.key });
   while (messageCache.size > MSG_CACHE_LIMIT) {
     messageCache.delete(messageCache.keys().next().value); // evict the oldest
   }
 }
 
 // With a chatId: the one cached message, or null.
-// Without a chatId: every cached message with that message ID (one per chat), as an array.
-function findCached(chatId, messageId) {
-  if (chatId) return messageCache.get(cacheKey(chatId, messageId)) || null;
+// Without a chatId: every cached message with that ID from this account, as an array.
+function findCached(acct, chatId, messageId) {
+  if (chatId) return messageCache.get(cacheKey(acct.key, chatId, messageId)) || null;
   const hits = [];
   for (const v of messageCache.values()) {
-    if (String(v.messageId) === String(messageId)) hits.push(v);
+    if (v._acct === acct.key && String(v.messageId) === String(messageId)) hits.push(v);
   }
   return hits;
 }
 
 // Loads recent messages from tracked chats into the cache at startup, in the background.
-async function prefillCache() {
+async function prefillCache(acct) {
   try {
-    const dialogs = await client.getDialogs({
-      limit: TRACKING_ON ? 300 : Number(PREFILL_DIALOGS) || 30,
+    const dialogs = await acct.client.getDialogs({
+      limit: acct.tracked.size ? 300 : Number(PREFILL_DIALOGS) || 30,
     });
     const perChat = Number(PREFILL_PER_CHAT) || 10;
     for (const d of dialogs) {
-      if (!d.inputEntity) continue;
-      if (!isTracked(String(d.id))) continue;
+      if (!d.inputEntity || !isTracked(acct, String(d.id))) continue;
       const title = d.title || d.name || null;
       try {
-        for await (const m of client.iterMessages(d.inputEntity, { limit: perChat })) {
-          if (m?.id) remember(summarize(m, title));
+        for await (const m of acct.client.iterMessages(d.inputEntity, { limit: perChat })) {
+          if (m?.id) remember(acct, summarize(acct, m, title));
         }
       } catch (_) {}
     }
-    console.log(`Message cache primed with ${messageCache.size} messages`);
+    console.log(`[${acct.label}] message cache primed`);
   } catch (e) {
-    console.error('cache prefill failed:', e.message);
+    console.error(`[${acct.label}] cache prefill failed:`, e.message);
   }
 }
 
@@ -284,43 +352,33 @@ function clampLimit(raw) {
   return Math.min(Math.max(parseInt(raw, 10) || 20, 1), MAX_HISTORY_LIMIT);
 }
 
-// Works out which chats to search.
-// Returns { targets: [{ key, peer, title }], targeted: boolean }.
-// peer is a numeric ID string (resolved via withPeer) or a GramJS input entity from a dialog.
-async function resolveTargets(chatIds, chatNames) {
-  // No filter: the most recent dialogs.
+// Works out which chats to search for one account.
+async function resolveTargets(acct, chatIds, chatNames) {
   if (!chatIds.length && !chatNames.length) {
-    const dialogs = await client.getDialogs({ limit: MAX_DIALOGS });
+    const dialogs = await acct.client.getDialogs({ limit: MAX_DIALOGS });
     const targets = [];
     for (const d of dialogs) {
       if (!d.inputEntity) continue;
-      targets.push({
-        key: String(d.id),
-        peer: d.inputEntity,
-        title: d.title || d.name || null,
-      });
+      targets.push({ key: String(d.id), peer: d.inputEntity, title: d.title || d.name || null });
     }
     return { targets, targeted: false };
   }
 
   const targets = new Map();
-
   for (const id of chatIds) {
     targets.set(id, { key: id, peer: id, title: null });
   }
 
   if (chatNames.length) {
     const needles = chatNames.map((n) => n.toLowerCase());
-    const dialogs = await client.getDialogs({ limit: MAX_NAME_LOOKUP });
+    const dialogs = await acct.client.getDialogs({ limit: MAX_NAME_LOOKUP });
     for (const d of dialogs) {
       const title = d.title || d.name || '';
       if (!d.inputEntity || !title) continue;
       const lower = title.toLowerCase();
       if (needles.some((n) => lower.includes(n))) {
         const key = String(d.id);
-        if (!targets.has(key)) {
-          targets.set(key, { key, peer: d.inputEntity, title });
-        }
+        if (!targets.has(key)) targets.set(key, { key, peer: d.inputEntity, title });
       }
     }
   }
@@ -328,12 +386,12 @@ async function resolveTargets(chatIds, chatNames) {
   return { targets: [...targets.values()], targeted: true };
 }
 
-// Scans one chat and returns up to `limit` matching messages, newest first.
-async function scanTarget(target, limit, senders, scanLimit) {
+// Scans one chat for one account and returns up to `limit` matching messages.
+async function scanTarget(acct, target, limit, senders, scanLimit) {
   const run = async (peer) => {
     const matched = [];
     let examined = 0;
-    for await (const m of client.iterMessages(peer, { limit: scanLimit })) {
+    for await (const m of acct.client.iterMessages(peer, { limit: scanLimit })) {
       examined++;
       if (!m || !m.id) continue;
       if (senders && !senders.has(String(m.senderId))) continue;
@@ -344,32 +402,24 @@ async function scanTarget(target, limit, senders, scanLimit) {
   };
 
   const { matched, examined } =
-    typeof target.peer === 'string' ? await withPeer(target.peer, run) : await run(target.peer);
+    typeof target.peer === 'string'
+      ? await withPeer(acct, target.peer, run)
+      : await run(target.peer);
 
   let title = target.title;
-  if (!title && matched.length) {
-    title = await chatTitleOf(matched[0]);
-  }
+  if (!title && matched.length) title = await chatTitleOf(matched[0]);
 
-  const messages = matched.map((m) => summarize(m, title));
-  messages.forEach(remember); // remember() ignores untracked chats
+  const messages = matched.map((m) => summarize(acct, m, title));
+  messages.forEach((s) => remember(acct, s));
 
-  return {
-    examined,
-    chat: { chatId: target.key, title },
-    messages,
-  };
+  return { examined, chat: { chatId: target.key, title, accountLabel: acct.label }, messages };
 }
 
-// Searches the resolved chats and merges the results, newest first.
-async function searchHistory({ chatIds, chatNames, limit, senders }) {
-  const { targets, targeted } = await resolveTargets(chatIds, chatNames);
+// Searches the chats for one account.
+async function searchAccount(acct, { chatIds, chatNames, limit, senders }) {
+  const { targets, targeted } = await resolveTargets(acct, chatIds, chatNames);
 
-  const scanLimit = senders
-    ? targeted
-      ? MAX_HISTORY_SCAN
-      : MAX_SCAN_PER_CHAT
-    : limit;
+  const scanLimit = senders ? (targeted ? MAX_HISTORY_SCAN : MAX_SCAN_PER_CHAT) : limit;
 
   const collected = [];
   const chats = [];
@@ -378,17 +428,41 @@ async function searchHistory({ chatIds, chatNames, limit, senders }) {
 
   for (const target of targets) {
     try {
-      const r = await scanTarget(target, limit, senders, scanLimit);
+      const r = await scanTarget(acct, target, limit, senders, scanLimit);
       scanned += r.examined;
       collected.push(...r.messages);
       chats.push(r.chat);
     } catch (e) {
-      console.error(`history scan failed for ${target.title || target.key}:`, e.message);
-      errors.push({ chatId: target.key, title: target.title, error: e.message });
+      console.error(`[${acct.label}] history scan failed for ${target.title || target.key}:`, e.message);
+      errors.push({ accountLabel: acct.label, chatId: target.key, title: target.title, error: e.message });
     }
   }
 
-  // Remove duplicates in case a chat matched by ID and by name.
+  return { scanned, messages: collected, chats, errors };
+}
+
+// Searches one account, or all of them, and merges the results.
+// The same message seen by two accounts in one group is returned once.
+async function searchHistory(which, opts) {
+  const list = which === 'all' ? accounts : [which];
+  const collected = [];
+  const chats = [];
+  const errors = [];
+  let scanned = 0;
+
+  for (const acct of list) {
+    try {
+      const r = await searchAccount(acct, opts);
+      scanned += r.scanned;
+      collected.push(...r.messages);
+      chats.push(...r.chats);
+      errors.push(...r.errors);
+    } catch (e) {
+      console.error(`[${acct.label}] history search failed:`, e.message);
+      errors.push({ accountLabel: acct.label, error: e.message });
+    }
+  }
+
   const seen = new Set();
   const unique = collected.filter((m) => {
     const k = `${m.chatId}:${m.messageId}`;
@@ -398,7 +472,7 @@ async function searchHistory({ chatIds, chatNames, limit, senders }) {
   });
 
   unique.sort((a, b) => b.date - a.date);
-  const messages = unique.slice(0, limit);
+  const messages = unique.slice(0, opts.limit);
 
   return { count: messages.length, scanned, messages, chats, errors };
 }
@@ -426,53 +500,53 @@ async function postToN8n(payload) {
   }
 }
 
-// New message -> { type: "text", ...message }
+// New message -> { type: "text", accountLabel, accountId, ...message }
 // Sent for every chat, so normal messages keep flowing even when tracking is limited.
-async function onNewMessage(event) {
+async function onNewMessage(acct, event) {
   try {
     const m = event.message;
     const title = await chatTitleOf(m);
-    const summary = summarize(m, title);
-    remember(summary); // only stored if the chat is tracked
+    const summary = summarize(acct, m, title);
+    remember(acct, summary); // only stored if the chat is tracked
     await postToN8n({ type: 'text', ...summary });
   } catch (e) {
-    console.error('onNewMessage error:', e);
+    console.error(`[${acct.label}] onNewMessage error:`, e);
   }
 }
 
-// Edited message -> { type: "edited", before, after }
-// The raw edit update holds the new message, so we fetch the wrapped version by ID
-// to get the same fields as everywhere else.
-async function onRawEdit(update) {
+const snapshot = (s) => ({
+  messageId: s.messageId,
+  text: s.text,
+  senderId: s.senderId,
+  sentAt: s.sentAt,
+  hasMedia: s.hasMedia,
+  mediaType: s.mediaType,
+});
+
+// Edited message -> { type: "edited", accountLabel, accountId, before, after }
+async function onRawEdit(acct, update) {
   try {
     const raw = update.message;
-    if (!raw || !raw.peerId) return;
+    if (!raw?.peerId) return;
 
     const peerId = peerIdOf(raw.peerId);
-    if (!peerId || !isTracked(peerId)) return;
+    if (!peerId || !isTracked(acct, peerId)) return;
 
-    const [fresh] = await withPeer(peerId, (peer) =>
-      client.getMessages(peer, { ids: [raw.id] }),
+    const [fresh] = await withPeer(acct, peerId, (peer) =>
+      acct.client.getMessages(peer, { ids: [raw.id] }),
     );
     if (!fresh) return;
 
     const chatId = String(fresh.chatId);
-    const before = messageCache.get(cacheKey(chatId, fresh.id)) || null;
+    const before = messageCache.get(cacheKey(acct.key, chatId, fresh.id)) || null;
     const title = await chatTitleOf(fresh);
-    const after = summarize(fresh, title);
-    remember(after);
-
-    const snapshot = (s) => ({
-      messageId: s.messageId,
-      text: s.text,
-      senderId: s.senderId,
-      sentAt: s.sentAt,
-      hasMedia: s.hasMedia,
-      mediaType: s.mediaType,
-    });
+    const after = summarize(acct, fresh, title);
+    remember(acct, after);
 
     await postToN8n({
       type: 'edited',
+      accountLabel: acct.label,
+      accountId: acct.id,
       chatId,
       chatTitle: title,
       detectedAt: nowWAT(),
@@ -482,41 +556,37 @@ async function onRawEdit(update) {
       after: snapshot(after),
     });
   } catch (e) {
-    console.error('onRawEdit error:', e);
+    console.error(`[${acct.label}] onRawEdit error:`, e);
   }
 }
 
-// Deleted messages -> { type: "deleted", ... }
-// Telegram sends only IDs. Channel and supergroup deletions include the channel ID;
-// other deletions don't, so the chat is matched from the cache by message ID.
-async function onRawDelete(update) {
+// Deleted messages -> { type: "deleted", accountLabel, accountId, ... }
+async function onRawDelete(acct, update) {
   try {
     const peerId =
       update.className === 'UpdateDeleteChannelMessages'
         ? String(utils.getPeerId(new Api.PeerChannel({ channelId: update.channelId })))
         : null;
-    await reportDeleted(peerId, update.messages || []);
+    await reportDeleted(acct, peerId, update.messages || []);
   } catch (e) {
-    console.error('onRawDelete error:', e);
+    console.error(`[${acct.label}] onRawDelete error:`, e);
   }
 }
 
-async function reportDeleted(peerId, rawIds) {
-  // Known chat that is not tracked: ignore.
-  if (peerId && !isTracked(peerId)) return;
+async function reportDeleted(acct, peerId, rawIds) {
+  if (peerId && !isTracked(acct, peerId)) return;
 
   const detectedAt = nowWAT();
 
   for (const rawId of rawIds) {
     const messageId = Number(rawId);
-    const found = findCached(peerId, messageId);
+    const found = findCached(acct, peerId, messageId);
 
     let original = null;
     let candidates;
     if (Array.isArray(found)) {
       if (found.length === 1) original = found[0];
       else if (found.length > 1) {
-        // Chat unknown and several cached messages share this ID: report each candidate.
         candidates = found.map((s) => ({
           chatId: s.chatId,
           chatTitle: s.chatTitle,
@@ -529,18 +599,19 @@ async function reportDeleted(peerId, rawIds) {
       original = found;
     }
 
-    // Chat unknown and nothing cached: with tracking on we can't confirm the chat
-    // is tracked, so skip it.
-    if (!peerId && TRACKING_ON && !original && !candidates) continue;
+    // Chat unknown, nothing cached, and tracking is on: can't confirm the chat is tracked, skip.
+    if (!peerId && acct.tracked.size && !original && !candidates) continue;
 
-    if (original) messageCache.delete(cacheKey(original.chatId, original.messageId));
+    if (original) messageCache.delete(cacheKey(acct.key, original.chatId, original.messageId));
 
     await postToN8n({
       type: 'deleted',
+      accountLabel: acct.label,
+      accountId: acct.id,
       messageId,
       chatId: peerId || original?.chatId || null,
       chatTitle: original?.chatTitle ?? null,
-      chatInferred: !peerId && !!original, // true when the chat was matched by message ID only
+      chatInferred: !peerId && !!original,
       detectedAt,
       cached: !!original,
       content: original
@@ -562,8 +633,20 @@ async function reportDeleted(peerId, rawIds) {
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
+const unknownAccount = (res, value) =>
+  res.status(400).json({
+    error: `unknown account: ${value}`,
+    accounts: accounts.map((a) => a.label),
+  });
+
 app.get('/health', (_req, res) => {
-  res.status(client.connected ? 200 : 503).json({ ok: !!client.connected });
+  const list = accounts.map((a) => ({
+    label: a.label,
+    id: a.id,
+    connected: !!a.client.connected,
+  }));
+  const ok = list.every((a) => a.connected);
+  res.status(ok ? 200 : 503).json({ ok, accounts: list });
 });
 
 app.use((req, res, next) => {
@@ -572,15 +655,17 @@ app.use((req, res, next) => {
   next();
 });
 
-// GET /download?chatId=...&messageId=...[&format=base64]
-// Returns the file bytes (photo/video/document). With format=base64 returns JSON.
+// GET /download?chatId=...&messageId=...[&account=label][&format=base64]
 app.get('/download', async (req, res) => {
   try {
-    const { chatId, messageId, format } = req.query;
+    const { chatId, messageId, format, account } = req.query;
+    const acct = pickAccount(account);
+    if (!acct) return unknownAccount(res, account);
     if (!chatId || !messageId) {
       return res.status(400).json({ error: 'chatId and messageId are required' });
     }
-    const msg = await getMessage(chatId, messageId);
+
+    const msg = await getMessage(acct, chatId, messageId);
     if (!msg) return res.status(404).json({ error: 'message not found' });
     if (!msg.media) return res.status(404).json({ error: 'message has no media' });
 
@@ -589,7 +674,7 @@ app.get('/download', async (req, res) => {
       return res.status(413).json({ error: `file larger than ${MAX_DOWNLOAD_MB} MB` });
     }
 
-    const buffer = await client.downloadMedia(msg, {});
+    const buffer = await acct.client.downloadMedia(msg, {});
     if (!buffer) return res.status(500).json({ error: 'download returned nothing' });
 
     const mime = msg.file?.mimeType || (msg.photo ? 'image/jpeg' : 'application/octet-stream');
@@ -597,7 +682,7 @@ app.get('/download', async (req, res) => {
     const name = msg.file?.name || `${msg.id}${ext}`;
 
     if (format === 'base64') {
-      return res.json({ fileName: name, mimeType: mime, base64: buffer.toString('base64') });
+      return res.json({ accountLabel: acct.label, fileName: name, mimeType: mime, base64: buffer.toString('base64') });
     }
     res.set({
       'Content-Type': mime,
@@ -611,31 +696,37 @@ app.get('/download', async (req, res) => {
   }
 });
 
-// POST /send  { chatId, text, replyTo? }   (chatId can also be "me" or a @username)
+// POST /send  { chatId, text, replyTo?, account? }   (chatId can also be "me" or a @username)
 app.post('/send', async (req, res) => {
   try {
-    const { chatId, text, replyTo } = req.body || {};
+    const { chatId, text, replyTo, account } = req.body || {};
+    const acct = pickAccount(account);
+    if (!acct) return unknownAccount(res, account);
     if (!chatId || !text) return res.status(400).json({ error: 'chatId and text are required' });
-    const peerFn = (peer) => client.sendMessage(peer, { message: text, replyTo });
+
+    const peerFn = (peer) => acct.client.sendMessage(peer, { message: text, replyTo });
     const sent = NUMERIC_ID_RE.test(String(chatId))
-      ? await withPeer(chatId, peerFn)
+      ? await withPeer(acct, chatId, peerFn)
       : await peerFn(String(chatId));
-    res.json({ ok: true, messageId: sent.id });
+    res.json({ ok: true, accountLabel: acct.label, messageId: sent.id });
   } catch (e) {
     console.error('/send error:', e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// GET /messages?chatId=...&limit=20
+// GET /messages?chatId=...&limit=20[&account=label]
 app.get('/messages', async (req, res) => {
   try {
-    const { chatId } = req.query;
+    const { chatId, account } = req.query;
+    const acct = pickAccount(account);
+    if (!acct) return unknownAccount(res, account);
     const limit = Math.min(Number(req.query.limit) || 20, 100);
     if (!chatId) return res.status(400).json({ error: 'chatId is required' });
-    const msgs = await withPeer(chatId, (peer) => client.getMessages(peer, { limit }));
-    const out = msgs.map((m) => summarize(m));
-    out.forEach(remember);
+
+    const msgs = await withPeer(acct, chatId, (peer) => acct.client.getMessages(peer, { limit }));
+    const out = msgs.map((m) => summarize(acct, m));
+    out.forEach((s) => remember(acct, s));
     res.json(out);
   } catch (e) {
     console.error('/messages error:', e);
@@ -645,16 +736,21 @@ app.get('/messages', async (req, res) => {
 
 // POST /history
 // Body (all optional):
+//   account:   label (or Telegram ID) of one account, or "all". Default: the first account.
 //   chatId:    one numeric chat ID                       -> that chat only
 //   chatIds:   array of numeric chat IDs                 -> only those chats
 //   chatNames: array of strings, case-insensitive match  -> chats whose title contains any of them
 //   senderIds: array of numeric Telegram user IDs        -> only messages from those users
 //   limit:     number of messages to return (default 20, max 500)
-//
-// With no chat filter, the search covers your most recent chats.
-// chatIds and chatNames can be combined; the result is the union of matching chats.
 app.post('/history', async (req, res) => {
   const body = req.body || {};
+
+  let which;
+  if (body.account === 'all') which = 'all';
+  else {
+    which = pickAccount(body.account);
+    if (!which) return unknownAccount(res, body.account);
+  }
 
   let chatIds;
   let chatNames;
@@ -678,13 +774,18 @@ app.post('/history', async (req, res) => {
   }
 
   try {
-    const result = await searchHistory({ chatIds, chatNames, limit, senders });
+    const result = await searchHistory(which, { chatIds, chatNames, limit, senders });
 
     if (scope === 'chat' && result.errors.length) {
       return res.status(500).json({ error: result.errors[0].error });
     }
 
-    res.json({ ok: true, scope, ...result });
+    res.json({
+      ok: true,
+      scope,
+      account: which === 'all' ? 'all' : which.label,
+      ...result,
+    });
   } catch (e) {
     console.error('/history error:', e);
     res.status(500).json({ error: e.message });
@@ -694,40 +795,46 @@ app.post('/history', async (req, res) => {
 /* ---------------------------------- boot ---------------------------------- */
 
 (async () => {
-  await client.connect();
-  if (!(await client.checkAuthorization())) {
-    console.error('Session is not authorized. Re-run generate-session.js and update TG_SESSION.');
-    process.exit(1);
+  for (const acct of accounts) {
+    await acct.client.connect();
+    if (!(await acct.client.checkAuthorization())) {
+      console.error(`[${acct.label}] session is not authorized. Re-run generate-session.js and update its TG_SESSION.`);
+      process.exit(1);
+    }
+
+    const me = await acct.client.getMe();
+    acct.id = String(me.id);
+    acct.connected = true;
+    console.log(`[${acct.label}] connected as ${me.username || me.firstName} (${me.id})`);
+    console.log(
+      acct.tracked.size
+        ? `[${acct.label}] tracking edits/deletes for ${[...acct.tracked].join(', ')}`
+        : `[${acct.label}] tracking edits/deletes for all chats`,
+    );
+
+    await warmEntityCache(acct);
+
+    acct.client.addEventHandler((event) => onNewMessage(acct, event), new NewMessage({}));
+    acct.client.addEventHandler(
+      (update) => onRawEdit(acct, update),
+      new Raw({ types: [Api.UpdateEditMessage, Api.UpdateEditChannelMessage] }),
+    );
+    acct.client.addEventHandler(
+      (update) => onRawDelete(acct, update),
+      new Raw({ types: [Api.UpdateDeleteMessages, Api.UpdateDeleteChannelMessages] }),
+    );
   }
-  const me = await client.getMe();
-  console.log(`Telegram connected as ${me.username || me.firstName} (${me.id})`);
-
-  console.log(
-    TRACKING_ON
-      ? `Tracking edits/deletes for ${TRACKED.size} chat(s): ${[...TRACKED].join(', ')}`
-      : 'Tracking edits/deletes for all chats',
-  );
-
-  await warmEntityCache();
-
-  client.addEventHandler(onNewMessage, new NewMessage({}));
-  client.addEventHandler(
-    onRawEdit,
-    new Raw({ types: [Api.UpdateEditMessage, Api.UpdateEditChannelMessage] }),
-  );
-  client.addEventHandler(
-    onRawDelete,
-    new Raw({ types: [Api.UpdateDeleteMessages, Api.UpdateDeleteChannelMessages] }),
-  );
 
   // Fill the cache in the background so the server starts answering right away.
-  prefillCache();
+  for (const acct of accounts) prefillCache(acct);
 
   const server = app.listen(Number(PORT), () => console.log(`HTTP API listening on :${PORT}`));
 
   const shutdown = async () => {
     server.close();
-    try { await client.disconnect(); } catch (_) {}
+    for (const acct of accounts) {
+      try { await acct.client.disconnect(); } catch (_) {}
+    }
     process.exit(0);
   };
   process.on('SIGTERM', shutdown);
