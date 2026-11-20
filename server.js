@@ -867,6 +867,7 @@ function startWatchdog() {
 
   // Fill the cache in the background so the server starts answering right away.
   for (const acct of accounts) prefillCache(acct);
+  startWatchdog();
 
   const server = app.listen(Number(PORT), () => console.log(`HTTP API listening on :${PORT}`));
 
