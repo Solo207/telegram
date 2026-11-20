@@ -792,6 +792,46 @@ app.post('/history', async (req, res) => {
   }
 });
 
+// Checks each account every minute. If one stays disconnected for 2 minutes,
+// the process exits so the container restart policy brings it back with a fresh connection.
+const WATCHDOG_INTERVAL_MS = 60 * 1000;
+const WATCHDOG_MAX_DOWN_MS = 2 * 60 * 1000;
+const downSince = new Map();
+
+function startWatchdog() {
+  setInterval(async () => {
+    for (const acct of accounts) {
+      let healthy = false;
+      try {
+        if (acct.client.connected) {
+          // A cheap request that fails if the socket is dead.
+          await acct.client.invoke(new Api.updates.GetState());
+          healthy = true;
+        }
+      } catch (_) {}
+
+      if (healthy) {
+        downSince.delete(acct.label);
+        continue;
+      }
+
+      if (!downSince.has(acct.label)) downSince.set(acct.label, Date.now());
+      console.warn(`[${acct.label}] connection unhealthy, trying to reconnect`);
+
+      try {
+        await acct.client.connect();
+      } catch (e) {
+        console.error(`[${acct.label}] reconnect failed:`, e.message);
+      }
+
+      if (Date.now() - downSince.get(acct.label) > WATCHDOG_MAX_DOWN_MS) {
+        console.error(`[${acct.label}] still down after 2 minutes, exiting so the container restarts`);
+        process.exit(1);
+      }
+    }
+  }, WATCHDOG_INTERVAL_MS);
+}
+
 /* ---------------------------------- boot ---------------------------------- */
 
 (async () => {
